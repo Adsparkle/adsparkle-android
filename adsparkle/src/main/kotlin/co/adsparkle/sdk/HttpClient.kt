@@ -3,7 +3,6 @@ package co.adsparkle.sdk
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
-import java.nio.charset.Charsets
 
 /**
  * Minimal HTTP client backed by [HttpURLConnection] — zero extra dependencies.

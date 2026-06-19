@@ -32,6 +32,10 @@ import kotlinx.coroutines.launch
  */
 object AdSparkle {
 
+    // ── Constants (declared first — referenced by property initializers below) ─
+    private const val DEFAULT_ENDPOINT_BASE = "https://api.adsparkle.co"
+    private const val POSTBACK_PATH         = "/api/tracking/postback"
+
     // ── Internal state (lateinit, guarded by [checkInitialized]) ─────────────
 
     @Volatile private var companyKey:    String         = ""
@@ -45,9 +49,6 @@ object AdSparkle {
 
     /** Coroutine scope backed by a SupervisorJob so one failure doesn't cancel siblings. */
     private val sdkScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-
-    private const val DEFAULT_ENDPOINT_BASE = "https://api.adsparkle.co"
-    private const val POSTBACK_PATH          = "/api/tracking/postback"
 
     // ── Initialisation ───────────────────────────────────────────────────────
 
