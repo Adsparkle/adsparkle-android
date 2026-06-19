@@ -33,7 +33,7 @@ dependencyResolutionManagement {
 ```kotlin
 // app/build.gradle.kts
 dependencies {
-    implementation("com.github.Adsparkle:adsparkle-android:0.1.0")
+    implementation("com.github.Adsparkle:adsparkle-android:0.1.1")
 }
 ```
 
@@ -42,7 +42,7 @@ dependencies {
 ```kotlin
 // app/build.gradle.kts  (maven central is already in the default repo list)
 dependencies {
-    implementation("co.adsparkle:adsparkle-android:0.1.0")
+    implementation("co.adsparkle:adsparkle-android:0.1.1")
 }
 ```
 
@@ -259,7 +259,7 @@ POST {endpointBase}/api/tracking/postback
 Content-Type: application/json
 X-Company-Key: <companyKey>
 X-SDK-Platform: android
-X-SDK-Version: 0.1.0
+X-SDK-Version: 0.1.1
 
 {
   "click_id":       "550e8400-e29b-41d4-a716-446655440000",
@@ -290,9 +290,9 @@ No manual rules are required in the consuming app.
 
 ### JitPack (automatic on tag)
 
-1. Push a Git tag matching the version: `git tag 0.1.0 && git push origin 0.1.0`
+1. Push a Git tag matching the version: `git tag 0.1.1 && git push origin 0.1.1`
 2. JitPack builds automatically. The `jitpack.yml` pins OpenJDK 17.
-3. Dependency: `com.github.Adsparkle:adsparkle-android:0.1.0`
+3. Dependency: `com.github.Adsparkle:adsparkle-android:0.1.1`
 
 ### Maven Central (Sonatype OSSRH)
 
@@ -314,7 +314,7 @@ No manual rules are required in the consuming app.
 
 ```bash
 ./gradlew :adsparkle:publishReleasePublicationToLocalRepository
-# Output at: build/maven-local/co/adsparkle/adsparkle-android/0.1.0/
+# Output at: build/maven-local/co/adsparkle/adsparkle-android/0.1.1/
 ```
 
 ---
