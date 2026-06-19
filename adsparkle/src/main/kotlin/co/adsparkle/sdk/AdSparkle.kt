@@ -1,316 +1,425 @@
 package co.adsparkle.sdk
 
 import android.content.Context
-import android.content.Intent
 import android.net.Uri
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
+import android.util.Log
+import org.json.JSONArray
+import org.json.JSONObject
+import java.util.Random
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 
 /**
- * AdSparkle Android SDK — public singleton.
+ * AdSparkle — Android client SDK for the viralif / adbird tracking platform.
  *
- * Usage:
+ * Mobile apps use this singleton to forward affiliate attribution events
+ * (install, sign-up, purchase, ...) to the tracking backend.
+ *
+ * Typical usage:
  * ```kotlin
- * // Application.onCreate or Activity.onCreate
- * AdSparkle.initialize(context, "YOUR_COMPANY_KEY")
- *
- * // Capture a click from a deep link / universal link
- * AdSparkle.handleDeepLink(intent)
- *
- * // Record a conversion
- * AdSparkle.trackConversion("purchase",
- *     transactionId = "txn_abc123",
- *     amount        = 49.99,
- *     currency      = "USD"
- * )
+ * AdSparkle.configure(context, companyKey = "co_xxx")
+ * AdSparkle.handleDeepLink(intent.data)   // capture click_id from the deep link
+ * AdSparkle.setUserId("user-123")
+ * AdSparkle.trackInstall()
+ * AdSparkle.trackPurchase(AdSparkleEvent(transactionId = "txn_1", amount = 9.99, currency = "USD"))
  * ```
  *
- * All I/O operations are dispatched to [Dispatchers.IO] — the public API is safe to call
- * from the main thread.
+ * Thread-safety: every public method returns immediately. All blocking work
+ * (persistence-backed networking) runs on a single-thread [ExecutorService] so
+ * the calling (main) thread is never blocked and events are sent in order.
+ *
+ * Security: [configure]'s `companyKey` is a *publishable* `co_` key. It is safe
+ * to embed in an app. HMAC signing secrets are never used on the client.
  */
 object AdSparkle {
 
-    // ── Constants (declared first — referenced by property initializers below) ─
-    private const val DEFAULT_ENDPOINT_BASE = "https://api.adsparkle.co"
-    private const val POSTBACK_PATH         = "/api/tracking/postback"
+    private const val TAG = "AdSparkle"
+    const val DEFAULT_BASE_URL = "https://api.adsparkle.co"
 
-    // ── Internal state (lateinit, guarded by [checkInitialized]) ─────────────
+    /** The fixed set of server-recognized event types. */
+    object EventType {
+        const val INSTALL = "install"
+        const val SIGN_UP = "sign_up"
+        const val LOGIN = "login"
+        const val DOWNLOAD = "download"
+        const val PURCHASE = "purchase"
+        const val SUBSCRIPTION = "subscription"
+        const val REFUND = "refund"
 
-    @Volatile private var companyKey:    String         = ""
-    @Volatile private var endpointBase:  String         = DEFAULT_ENDPOINT_BASE
-    @Volatile private var initialized:   Boolean        = false
+        internal val ALL = setOf(
+            INSTALL, SIGN_UP, LOGIN, DOWNLOAD, PURCHASE, SUBSCRIPTION, REFUND
+        )
+    }
 
-    private lateinit var clickStore:     ClickStore
-    private lateinit var userStore:      UserStore
-    private lateinit var retryQueue:     RetryQueue
-    private lateinit var networkMonitor: NetworkMonitor
+    // Guards initialization and mutation of configuration fields.
+    private val lock = Any()
 
-    /** Coroutine scope backed by a SupervisorJob so one failure doesn't cancel siblings. */
-    private val sdkScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    @Volatile private var storage: Storage? = null
+    @Volatile private var client: PostbackClient? = null
+    @Volatile private var executor: ExecutorService? = null
 
-    // ── Initialisation ───────────────────────────────────────────────────────
+    @Volatile private var companyKey: String? = null
+    @Volatile private var baseUrl: String = DEFAULT_BASE_URL
+    @Volatile private var debug: Boolean = false
+
+    // -------------------------------------------------------------------------
+    // Configuration
+    // -------------------------------------------------------------------------
 
     /**
-     * Initialises the SDK. Must be called before any other method, typically in
-     * [android.app.Application.onCreate].
+     * Initializes the SDK. Call once, as early as possible (e.g. in
+     * `Application.onCreate`). Safe to call again to update configuration.
      *
-     * @param context     Application or Activity context (stored as applicationContext).
-     * @param companyKey  Your AdSparkle company API key (sent as `X-Company-Key`).
-     * @param endpointBase Override the default API base URL (no trailing slash).
+     * @param context     any context; the application context is retained.
+     * @param companyKey  publishable `co_` key (not a secret).
+     * @param baseUrl     tracking API base url; defaults to [DEFAULT_BASE_URL].
+     * @param debug       enables verbose logging.
      */
     @JvmStatic
     @JvmOverloads
-    fun initialize(
-        context:      Context,
-        companyKey:   String,
-        endpointBase: String = DEFAULT_ENDPOINT_BASE
+    fun configure(
+        context: Context,
+        companyKey: String,
+        baseUrl: String = DEFAULT_BASE_URL,
+        debug: Boolean = false,
     ) {
-        require(companyKey.isNotBlank()) { "AdSparkle: companyKey must not be blank" }
+        synchronized(lock) {
+            val store = storage ?: Storage(context.applicationContext).also { storage = it }
 
-        val appContext   = context.applicationContext
-        this.companyKey  = companyKey
-        this.endpointBase = endpointBase.trimEnd('/')
+            this.debug = debug
+            this.companyKey = companyKey
+            this.baseUrl = baseUrl.ifBlank { DEFAULT_BASE_URL }
 
-        clickStore     = ClickStore(appContext)
-        userStore      = UserStore(appContext)
-        retryQueue     = RetryQueue(appContext)
-        networkMonitor = NetworkMonitor(appContext) {
-            // Auto-flush when network comes back
-            flushQueue()
+            store.companyKey = this.companyKey
+            store.baseUrl = this.baseUrl
+
+            if (client == null) client = PostbackClient(debug)
+            if (executor == null) {
+                executor = Executors.newSingleThreadExecutor { r ->
+                    Thread(r, "AdSparkle-Worker").apply { isDaemon = true }
+                }
+            }
+
+            if (debug) Log.d(TAG, "Configured. baseUrl=${this.baseUrl}")
         }
-        networkMonitor.register()
 
-        // Prune stale click ids on every cold start
-        sdkScope.launch { clickStore.pruneExpired() }
-
-        initialized = true
-        AdSparkleLogger.d("AdSparkle SDK v${BuildConfig.SDK_VERSION} initialized  endpoint=$endpointBase")
+        // Attempt to send anything that failed on a previous run.
+        flushPending()
     }
 
-    // ── Debug toggle ─────────────────────────────────────────────────────────
+    // -------------------------------------------------------------------------
+    // Identity & attribution
+    // -------------------------------------------------------------------------
 
-    /**
-     * Enables verbose Logcat output tagged `AdSparkle`. Disable in production.
-     */
-    @JvmStatic
-    fun enableDebugLogging(enabled: Boolean) {
-        AdSparkleLogger.debugEnabled = enabled
-    }
-
-    // ── Click capture ────────────────────────────────────────────────────────
-
-    /**
-     * Convenience wrapper — extracts the [Uri] from [intent] and delegates to [trackClick].
-     * Safe to call even if the intent has no data.
-     */
-    @JvmStatic
-    fun handleDeepLink(intent: Intent) {
-        intent.data?.let { trackClick(it) }
-    }
-
-    /**
-     * Parses [uri] for a `click_id` query parameter, validates it, and adds it to the
-     * persisted click chain.
-     *
-     * @param uri The incoming deep-link / universal-link URI.
-     */
-    @JvmStatic
-    fun trackClick(uri: Uri) {
-        checkInitialized()
-        val raw = uri.getQueryParameter("click_id")
-        if (raw.isNullOrBlank()) {
-            AdSparkleLogger.d("trackClick: no click_id in URI $uri — skipping")
-            return
-        }
-        // IO-bound persistence, but ClickStore.add is fast — launch off-main anyway
-        sdkScope.launch { clickStore.add(raw) }
-    }
-
-    // ── User identity ─────────────────────────────────────────────────────────
-
-    /**
-     * Overrides the user id used in all subsequent postback calls.
-     * If never called, an anonymous id (`anon_…`) is generated and persisted automatically.
-     */
+    /** Sets the current user id; persisted and attached to every event. */
     @JvmStatic
     fun setUserId(userId: String) {
-        checkInitialized()
-        require(userId.isNotBlank()) { "AdSparkle: userId must not be blank" }
-        sdkScope.launch { userStore.setUserId(userId) }
+        val store = storage
+        if (store == null) {
+            warnNotConfigured("setUserId")
+            return
+        }
+        store.userId = userId
+        if (debug) Log.d(TAG, "userId set")
     }
 
-    // ── Conversion tracking ──────────────────────────────────────────────────
+    /**
+     * Extracts `click_id` from a deep-link [uri] (`?click_id=<uuid>`), persists
+     * it as the active click id, and appends it to the click chain (de-duped,
+     * max 50, 7-day sliding TTL). No-op when [uri] is null or carries no valid
+     * click id.
+     */
+    @JvmStatic
+    fun handleDeepLink(uri: Uri?) {
+        val clickId = DeepLink.extractClickId(uri) ?: run {
+            if (debug) Log.d(TAG, "handleDeepLink: no click_id in uri")
+            return
+        }
+        setClickId(clickId)
+    }
 
     /**
-     * Records a conversion event by POSTing to the AdSparkle postback endpoint.
+     * Sets the active click id directly and appends it to the chain. Silently
+     * ignores values that are not well-formed UUIDs (parity with adsparkle.js).
+     */
+    @JvmStatic
+    fun setClickId(clickId: String) {
+        val store = storage
+        if (store == null) {
+            warnNotConfigured("setClickId")
+            return
+        }
+        val trimmed = clickId.trim()
+        if (trimmed.isEmpty()) return
+        if (!Storage.UUID_RE.matches(trimmed)) {
+            if (debug) Log.w(TAG, "setClickId ignored: not a valid UUID")
+            return
+        }
+        store.clickId = trimmed
+        store.addClickId(trimmed)
+        if (debug) Log.d(TAG, "clickId captured")
+    }
+
+    /** Returns the currently active click id, or null if none captured yet. */
+    @JvmStatic
+    fun getClickId(): String? = storage?.clickId
+
+    // -------------------------------------------------------------------------
+    // Tracking
+    // -------------------------------------------------------------------------
+
+    /**
+     * Tracks an event of [eventType] (must be one of [EventType]). The optional
+     * [event] carries transaction/amount/product/custom data.
      *
-     * If the click-id chain is empty (organic traffic) the call is silently ignored and
-     * [callback] receives `false` — this is expected and not an error.
-     *
-     * Failed requests are persisted to the offline retry queue and re-sent automatically
-     * when network connectivity is restored, or on the next [flushQueue] call.
-     *
-     * @param type          Event type string (see [EventType] for accepted values and aliases).
-     * @param transactionId Optional external transaction / order id.
-     * @param amount        Optional monetary amount (e.g. purchase value).
-     * @param currency      Optional ISO 4217 currency code (e.g. "USD").
-     * @param productIds    Optional list of product / SKU identifiers.
-     * @param customParams  Optional arbitrary key-value pairs forwarded as-is.
-     * @param callback      Invoked on the calling thread with `true` on success, `false` otherwise.
+     * Validates locally and silently skips (logging a warning in debug mode,
+     * never throwing) when: not configured, unknown event type, or missing
+     * click id / user id.
      */
     @JvmStatic
     @JvmOverloads
-    fun trackConversion(
-        type:          String,
-        transactionId: String?               = null,
-        amount:        Double?               = null,
-        currency:      String?               = null,
-        productIds:    List<String>?         = null,
-        customParams:  Map<String, String>?  = null,
-        callback:      ((Boolean) -> Unit)?  = null
-    ) {
-        checkInitialized()
+    fun track(eventType: String, event: AdSparkleEvent = AdSparkleEvent()) {
+        val store = storage
+        val key = companyKey
+        val httpClient = client
+        val exec = executor
 
-        sdkScope.launch {
-            val result = trackConversionInternal(
-                type, transactionId, amount, currency, productIds, customParams
-            )
-            val success = result is ConversionResult.Success
-            callback?.invoke(success)
+        if (store == null || key == null || httpClient == null || exec == null) {
+            warnNotConfigured("track")
+            return
+        }
+
+        if (eventType !in EventType.ALL) {
+            if (debug) Log.w(TAG, "track skipped: unknown event_type='$eventType'")
+            return
+        }
+
+        val clickId = store.clickId
+
+        if (clickId.isNullOrEmpty()) {
+            if (debug) Log.w(TAG, "track skipped: no click_id (call handleDeepLink/setClickId first)")
+            return
+        }
+
+        // Anonymous fallback (parity with adsparkle.js getOrCreateAnonId): never
+        // drop a conversion just because the merchant did not call setUserId —
+        // mint and persist a stable anonymous id instead.
+        val userId = store.userId?.takeIf { it.isNotEmpty() } ?: getOrCreateAnonId(store)
+
+        val clickIds = store.getClickIds()
+        val payload = buildPayload(eventType, clickId, clickIds, userId, event)
+        val currentBaseUrl = baseUrl
+
+        exec.execute {
+            // Opportunistically flush any backlog first so ordering is preserved.
+            drainPendingInternal(store, httpClient, key, currentBaseUrl)
+
+            val ok = httpClient.send(currentBaseUrl, key, payload)
+            if (!ok) {
+                store.enqueuePending(payload)
+                if (debug) Log.w(TAG, "Event queued for retry: $eventType")
+            }
         }
     }
 
     /**
-     * Suspending variant for callers using coroutines directly.
-     * Returns a typed [ConversionResult].
-     */
-    suspend fun trackConversionAsync(
-        type:          String,
-        transactionId: String?               = null,
-        amount:        Double?               = null,
-        currency:      String?               = null,
-        productIds:    List<String>?         = null,
-        customParams:  Map<String, String>?  = null
-    ): ConversionResult {
-        checkInitialized()
-        return trackConversionInternal(type, transactionId, amount, currency, productIds, customParams)
-    }
-
-    // ── Queue management ─────────────────────────────────────────────────────
-
-    /**
-     * Retries all pending items in the offline queue.
-     * Automatically called whenever network becomes available.
-     * Safe to call manually (e.g. on app foreground).
+     * Re-attempts delivery of any events that were persisted after exhausting
+     * their retries. Safe to call anytime; runs on the background worker.
      */
     @JvmStatic
-    fun flushQueue() {
-        checkInitialized()
-        sdkScope.launch { flushQueueInternal() }
+    fun flushPending() {
+        val store = storage ?: return
+        val key = companyKey ?: return
+        val httpClient = client ?: return
+        val exec = executor ?: return
+        val currentBaseUrl = baseUrl
+        exec.execute {
+            drainPendingInternal(store, httpClient, key, currentBaseUrl)
+        }
     }
 
-    // ── Internal helpers ─────────────────────────────────────────────────────
+    // ---- Typed convenience helpers ----
 
-    private suspend fun trackConversionInternal(
-        type:          String,
-        transactionId: String?,
-        amount:        Double?,
-        currency:      String?,
-        productIds:    List<String>?,
-        customParams:  Map<String, String>?
-    ): ConversionResult {
+    @JvmStatic @JvmOverloads
+    fun trackInstall(event: AdSparkleEvent = AdSparkleEvent()) = track(EventType.INSTALL, event)
 
-        // 1. Resolve event type
-        val eventType = EventType.resolve(type)
-        if (eventType == null) {
-            AdSparkleLogger.w("trackConversion: unknown event type '$type' — rejected")
-            return ConversionResult.UnknownEventType(type)
-        }
+    @JvmStatic @JvmOverloads
+    fun trackSignUp(event: AdSparkleEvent = AdSparkleEvent()) = track(EventType.SIGN_UP, event)
 
-        // 2. Prune and read click chain
-        clickStore.pruneExpired()
-        val chain    = clickStore.getChain()
-        val clickId  = chain.lastOrNull()
+    @JvmStatic @JvmOverloads
+    fun trackLogin(event: AdSparkleEvent = AdSparkleEvent()) = track(EventType.LOGIN, event)
 
-        if (clickId == null) {
-            AdSparkleLogger.d("trackConversion: click chain is empty — organic traffic, skipping postback")
-            return ConversionResult.NoClickId
-        }
+    @JvmStatic @JvmOverloads
+    fun trackDownload(event: AdSparkleEvent = AdSparkleEvent()) = track(EventType.DOWNLOAD, event)
 
-        // 3. Build payload
-        val payload = PostbackPayload(
-            clickId       = clickId,
-            clickIds      = chain,
-            eventType     = eventType.canonical,
-            userId        = userStore.getUserId(),
-            transactionId = transactionId,
-            amount        = amount,
-            currency      = currency,
-            productIds    = productIds,
-            customParams  = customParams
+    @JvmStatic @JvmOverloads
+    fun trackPurchase(event: AdSparkleEvent = AdSparkleEvent()) = track(EventType.PURCHASE, event)
+
+    @JvmStatic @JvmOverloads
+    fun trackSubscription(event: AdSparkleEvent = AdSparkleEvent()) = track(EventType.SUBSCRIPTION, event)
+
+    @JvmStatic @JvmOverloads
+    fun trackRefund(event: AdSparkleEvent = AdSparkleEvent()) = track(EventType.REFUND, event)
+
+    // ---- Adjust-style otomatik ürün yakalama (Play Billing) ----
+    //
+    // Play Billing `Purchase` objesinden ürün kimliklerini (ve order id'yi)
+    // KENDİLİĞİNDEN çıkarır; merchant SKU'yu elle yazmak zorunda kalmaz. Web
+    // SDK'daki dataLayer otomatik yakalamanın mobil karşılığı — mobilde ödeme
+    // Play Store üzerinden geçtiği için ürün kimliği makbuzda zaten vardır.
+    //
+    // ÖNEMLİ: billingclient'a HARD bağımlılık EKLENMEZ. `Purchase` objesi
+    // reflection ile okunur; böylece Play Billing kullanmayan uygulamalar
+    // etkilenmez ve SDK bağımlılık-yüzeyi büyümez.
+    //
+    // amount/currency Purchase'da bulunmadığı için yüzde komisyonlu event'lerde
+    // merchant tarafından geçilmelidir.
+
+    @JvmStatic @JvmOverloads
+    fun trackPurchaseFromBilling(
+        purchase: Any,
+        amount: Double? = null,
+        currency: String? = null,
+        customParams: Map<String, String>? = null,
+    ) = trackFromBilling(EventType.PURCHASE, purchase, amount, currency, customParams)
+
+    @JvmStatic @JvmOverloads
+    fun trackSubscriptionFromBilling(
+        purchase: Any,
+        amount: Double? = null,
+        currency: String? = null,
+        customParams: Map<String, String>? = null,
+    ) = trackFromBilling(EventType.SUBSCRIPTION, purchase, amount, currency, customParams)
+
+    private fun trackFromBilling(
+        eventType: String,
+        purchase: Any,
+        amount: Double?,
+        currency: String?,
+        customParams: Map<String, String>?,
+    ) {
+        val productIds = extractBillingProductIds(purchase)
+        track(
+            eventType,
+            AdSparkleEvent(
+                transactionId = extractBillingTransactionId(purchase),
+                amount = amount,
+                currency = currency,
+                productIds = productIds.takeIf { it.isNotEmpty() },
+                customParams = customParams,
+            ),
         )
-        val json      = payload.toJson()
-        val endpoint  = "$endpointBase$POSTBACK_PATH"
-
-        // 4. Send
-        return sendPayload(endpoint, json)
     }
 
-    private fun sendPayload(endpoint: String, json: String): ConversionResult {
-        return try {
-            val ok = HttpClient.post(endpoint, companyKey, json)
-            if (ok) {
-                ConversionResult.Success
-            } else {
-                AdSparkleLogger.w("sendPayload: server rejected postback — queuing for retry")
-                retryQueue.enqueue(json)
-                ConversionResult.Queued()
-            }
-        } catch (e: Exception) {
-            AdSparkleLogger.e("sendPayload: exception — queuing for retry", e)
-            retryQueue.enqueue(json)
-            ConversionResult.Queued(e)
-        }
-    }
-
-    private fun flushQueueInternal() {
-        if (!networkMonitor.isConnected()) {
-            AdSparkleLogger.d("flushQueue: no network — skipping flush")
-            return
-        }
-        val pending = retryQueue.drainAll()
-        if (pending.isEmpty()) {
-            AdSparkleLogger.d("flushQueue: queue is empty")
-            return
-        }
-        AdSparkleLogger.i("flushQueue: retrying ${pending.size} item(s)")
-        val endpoint  = "$endpointBase$POSTBACK_PATH"
-        val requeued  = mutableListOf<String>()
-
-        pending.forEach { json ->
+    /** Play Billing Purchase.getProducts() (yeni API) → getSkus() (eski) reflection ile. */
+    private fun extractBillingProductIds(purchase: Any): List<String> {
+        for (method in listOf("getProducts", "getSkus")) {
             try {
-                val ok = HttpClient.post(endpoint, companyKey, json)
-                if (!ok) {
-                    AdSparkleLogger.w("flushQueue: retry failed, re-queuing item")
-                    requeued.add(json)
-                } else {
-                    AdSparkleLogger.d("flushQueue: retry succeeded")
+                val result = purchase.javaClass.getMethod(method).invoke(purchase)
+                if (result is List<*>) {
+                    val ids = result.filterIsInstance<String>()
+                    if (ids.isNotEmpty()) return ids
                 }
-            } catch (e: Exception) {
-                AdSparkleLogger.e("flushQueue: exception during retry", e)
-                requeued.add(json)
-            }
+            } catch (_: Exception) { /* bir sonraki method adını dene */ }
         }
-        // Re-enqueue anything that still failed
-        requeued.forEach { retryQueue.enqueue(it) }
-        AdSparkleLogger.i("flushQueue: complete  succeeded=${pending.size - requeued.size}  requeued=${requeued.size}")
+        return emptyList()
     }
 
-    private fun checkInitialized() {
-        check(initialized) {
-            "AdSparkle SDK is not initialized. Call AdSparkle.initialize(context, companyKey) first."
+    /** Play Billing Purchase.getOrderId() → getPurchaseToken() reflection ile. */
+    private fun extractBillingTransactionId(purchase: Any): String? {
+        for (method in listOf("getOrderId", "getPurchaseToken")) {
+            try {
+                val result = purchase.javaClass.getMethod(method).invoke(purchase)
+                if (result is String && result.isNotEmpty()) return result
+            } catch (_: Exception) { /* bir sonraki method adını dene */ }
         }
+        return null
+    }
+
+    // -------------------------------------------------------------------------
+    // Internals
+    // -------------------------------------------------------------------------
+
+    /** Must be called on the background worker. Sends and drops on success. */
+    private fun drainPendingInternal(
+        store: Storage,
+        httpClient: PostbackClient,
+        key: String,
+        currentBaseUrl: String,
+    ) {
+        val pending = store.drainPendingQueue()
+        if (pending.isEmpty()) return
+        val stillFailing = ArrayList<String>()
+        for (payload in pending) {
+            val ok = httpClient.send(currentBaseUrl, key, payload)
+            if (!ok) stillFailing.add(payload)
+        }
+        // Re-queue the ones that failed again so they survive to the next flush.
+        for (payload in stillFailing) {
+            store.enqueuePending(payload)
+        }
+        if (debug && stillFailing.isNotEmpty()) {
+            Log.w(TAG, "Flush incomplete: ${stillFailing.size} event(s) still pending")
+        }
+    }
+
+    private fun buildPayload(
+        eventType: String,
+        clickId: String,
+        clickIds: List<String>,
+        userId: String,
+        event: AdSparkleEvent,
+    ): String {
+        val json = JSONObject()
+        json.put("click_id", clickId)
+        // click_ids is always present (parity with adsparkle.js): the chain is
+        // non-empty whenever a conversion fires, since click_id is mandatory. If
+        // the persisted chain expired under TTL between capture and send, fall
+        // back to the active click_id so attribution is never lost.
+        val chain = if (clickIds.isNotEmpty()) clickIds else listOf(clickId)
+        json.put("click_ids", JSONArray(chain))
+        json.put("event_type", eventType)
+        json.put("user_id", userId)
+
+        event.transactionId?.let { json.put("transaction_id", it) }
+        event.amount?.let { json.put("amount", it) }
+        event.currency?.let { json.put("currency", it) }
+
+        event.productIds?.takeIf { it.isNotEmpty() }?.let { ids ->
+            json.put("product_ids", JSONArray(ids))
+        }
+
+        event.customParams?.takeIf { it.isNotEmpty() }?.let { params ->
+            val obj = JSONObject()
+            for ((k, v) in params) obj.put(k, v)
+            json.put("custom_params", obj)
+        }
+
+        return json.toString()
+    }
+
+    /** Charset for base36 random suffix (0-9a-z), matching JS toString(36). */
+    private const val BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+    /**
+     * Returns the persisted user id, or mints, persists, and returns a new
+     * anonymous one: `anon_` + base36(now) + 8 base36 random chars (parity with
+     * adsparkle.js getOrCreateAnonId). The value need not be cryptographically
+     * random — uniqueness, not unpredictability, is the goal.
+     */
+    private fun getOrCreateAnonId(store: Storage): String {
+        store.userId?.takeIf { it.isNotEmpty() }?.let { return it }
+        val random = Random()
+        val suffix = StringBuilder(8)
+        repeat(8) { suffix.append(BASE36[random.nextInt(BASE36.length)]) }
+        val anon = "anon_" + System.currentTimeMillis().toString(36) + suffix
+        store.userId = anon
+        if (debug) Log.d(TAG, "anonymous user_id generated")
+        return anon
+    }
+
+    private fun warnNotConfigured(method: String) {
+        // Logged unconditionally: calling before configure() is a programming error.
+        Log.w(TAG, "$method() called before configure(); ignoring.")
     }
 }
