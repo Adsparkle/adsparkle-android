@@ -51,6 +51,12 @@ object AdSparkle {
         )
     }
 
+    // Accepted event_type shape: a built-in key (e.g. "purchase") OR a company
+    // custom-event shortId (e.g. "YE2YFSQ"). Mixed case on purpose — shortIds are
+    // uppercase, built-in keys lowercase. Mirrors the backend's /^[a-zA-Z0-9_]+$/
+    // (1-64 chars). EventType constants above remain as convenience.
+    private val EVENT_TYPE_RE = Regex("^[A-Za-z0-9_]{1,64}$")
+
     // Guards initialization and mutation of configuration fields.
     private val lock = Any()
 
@@ -189,8 +195,8 @@ object AdSparkle {
             return
         }
 
-        if (eventType !in EventType.ALL) {
-            if (debug) Log.w(TAG, "track skipped: unknown event_type='$eventType'")
+        if (!EVENT_TYPE_RE.matches(eventType)) {
+            if (debug) Log.w(TAG, "invalid event_type: $eventType")
             return
         }
 

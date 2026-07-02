@@ -28,7 +28,7 @@ dependencyResolutionManagement {
 ```kotlin
 // app/build.gradle.kts
 dependencies {
-    implementation("com.github.Adsparkle:adsparkle-android:0.1.2")
+    implementation("com.github.Adsparkle:adsparkle-android:0.1.3")
 }
 ```
 
@@ -36,7 +36,7 @@ dependencies {
 
 ```groovy
 dependencies {
-    implementation 'com.github.Adsparkle:adsparkle-android:0.1.2'
+    implementation 'com.github.Adsparkle:adsparkle-android:0.1.3'
 }
 ```
 
@@ -148,7 +148,8 @@ AdSparkle.track("purchase", AdSparkleEvent(amount = 5.0, currency = "EUR"))
 
 ### Event types
 
-The set of event types is fixed and matches the backend contract:
+The seven built-in event types below have typed helpers and match the backend
+contract:
 
 | Event type     | Helper                  | Typical extra fields                          |
 |----------------|-------------------------|-----------------------------------------------|
@@ -159,6 +160,18 @@ The set of event types is fixed and matches the backend contract:
 | `purchase`     | `trackPurchase()`       | `transactionId`, `amount`, `currency`, `productIds` |
 | `subscription` | `trackSubscription()`   | `transactionId`, `amount`, `currency`         |
 | `refund`       | `trackRefund()`         | `transactionId`                               |
+
+You are **not** limited to these seven. To fire a company **custom event**, pass
+its shortId (e.g. `"YE2YFSQ"`) as the `event_type`:
+
+```kotlin
+AdSparkle.track("YE2YFSQ", AdSparkleEvent(amount = 5.0, currency = "EUR"))
+```
+
+`event_type` is accepted when it matches `^[A-Za-z0-9_]{1,64}$` (mixed case:
+uppercase custom-event shortIds and lowercase built-in keys both pass); anything
+else is skipped locally. `productIds` and `custom_params` are already supported
+for every event type, custom events included.
 
 All `AdSparkleEvent` fields are optional/nullable; pass only what applies.
 
