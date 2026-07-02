@@ -1,6 +1,6 @@
 # AdSparkle Android SDK
 
-Android client SDK for the **viralif / adbird** affiliate tracking platform.
+Android client SDK for the **AdSparkle** affiliate tracking platform.
 Mobile apps use it to forward attribution events (install, sign-up, purchase, …)
 to the tracking backend.
 
@@ -239,4 +239,4 @@ reflection, ensure `co.adsparkle.sdk.AdSparkle` and
 
 ## License
 
-Proprietary — © viralif / adbird.
+Proprietary — © AdSparkle.

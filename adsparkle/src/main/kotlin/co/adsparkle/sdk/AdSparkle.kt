@@ -10,7 +10,7 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 /**
- * AdSparkle — Android client SDK for the viralif / adbird tracking platform.
+ * AdSparkle — Android client SDK for the AdSparkle tracking platform.
  *
  * Mobile apps use this singleton to forward affiliate attribution events
  * (install, sign-up, purchase, ...) to the tracking backend.
