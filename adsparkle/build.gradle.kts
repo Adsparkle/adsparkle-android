@@ -62,6 +62,12 @@ dependencies {
     implementation(libs.kotlin.stdlib)
     implementation(libs.kotlinx.coroutines.android)
 
+    // Google Play Install Referrer — Android deferred (install) attribution'in
+    // cekirdegi: taze kurulumda click_id'yi Play Store referrer'indan kurtarir.
+    // (Play Billing'in aksine bu opsiyonel bir ozellik degil, ana attribution
+    // yolu oldugu icin reflection yerine gercek bagimlilik olarak eklenir.)
+    implementation("com.android.installreferrer:installreferrer:2.2")
+
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.espresso.core)

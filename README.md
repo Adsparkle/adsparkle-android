@@ -100,6 +100,84 @@ AdSparkle.setClickId("e1b2c3d4-...")
 val current = AdSparkle.getClickId()
 ```
 
+### App Links (deferred deterministic click)
+
+When an attribution link `https://<slug>.go.adsparkle.co/<uniqueKey>?…` opens your
+app via **Android App Links** (the app is already installed), the OS launches the
+app directly — the tracking server is **never hit**, so no click is recorded and
+the URL carries **no `click_id`**.
+
+`handleDeepLink` handles this automatically: if the incoming `Uri` has no
+`click_id` but its host ends with `.go.adsparkle.co`, the SDK asks the backend to
+create a **deterministic** click from the `uniqueKey` and captures the resulting
+`click_id`. It sends a stable, SDK-generated **device id** (see below) and **no
+device fingerprint**. If the request fails, it is persisted and retried on the
+next `configure()` / `track()` / deep-link — you don't need to do anything.
+
+No extra code is required beyond the `handleDeepLink(intent?.data)` calls shown
+above. Make sure your App Links / intent filters route `*.go.adsparkle.co` links
+into an Activity that forwards the `Uri` to `handleDeepLink`.
+
+---
+
+## Auto Backup / device_id (required manifest step)
+
+The SDK generates and persists a stable **device id** (a random UUID in its own
+`SharedPreferences` file, `adsparkle_prefs.xml`). It is used as the idempotency
+key for deterministic clicks so the backend can de-duplicate the same install /
+click. It is **not** `ANDROID_ID` or an advertising id.
+
+**Android Auto Backup is ON by default.** If left unchecked, `adsparkle_prefs.xml`
+is backed up to the cloud (or copied during device-to-device transfer) and
+restored onto a **different** device — so two devices would report the **same**
+device id, corrupting attribution counts. You must exclude the SDK's prefs file
+from backup.
+
+The SDK ships two ready-to-use resources for this:
+
+- `@xml/adsparkle_backup_rules` — for `android:fullBackupContent` (API 23–30)
+- `@xml/adsparkle_data_extraction_rules` — for `android:dataExtractionRules`
+  (Android 12+ / API 31+; covers both cloud-backup and device-transfer)
+
+> The library manifest intentionally does **not** declare these attributes — doing
+> so would collide with (or silently override) your app's own backup rules during
+> manifest merging. You must wire them up in **your** app's manifest.
+
+**If your app has no backup rules yet**, point your `<application>` at the shipped
+resources:
+
+```xml
+<application
+    android:fullBackupContent="@xml/adsparkle_backup_rules"
+    android:dataExtractionRules="@xml/adsparkle_data_extraction_rules"
+    ... >
+```
+
+**If your app already has backup rules**, keep yours and add the exclusion to
+them instead:
+
+```xml
+<!-- your existing @xml/…_backup_rules.xml (fullBackupContent) -->
+<full-backup-content>
+    <!-- your existing rules … -->
+    <exclude domain="sharedpref" path="adsparkle_prefs.xml" />
+</full-backup-content>
+```
+
+```xml
+<!-- your existing @xml/…_data_extraction_rules.xml (Android 12+) -->
+<data-extraction-rules>
+    <cloud-backup>
+        <!-- your existing rules … -->
+        <exclude domain="sharedpref" path="adsparkle_prefs.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <!-- your existing rules … -->
+        <exclude domain="sharedpref" path="adsparkle_prefs.xml" />
+    </device-transfer>
+</data-extraction-rules>
+```
+
 ---
 
 ## Identifying the user

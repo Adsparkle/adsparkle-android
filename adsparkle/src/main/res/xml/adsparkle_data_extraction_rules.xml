@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  AdSparkle SDK — yedek/aktarim haric-tutma kurallari (Android 12+ / API 31+ icin
+  android:dataExtractionRules).
+
+  adsparkle_prefs, SDK'nin KALICI device_id'sini tutar (D2 tek-tuketim idempotency
+  anahtari). Android 12+ iki ayri senaryoyu ayirir; her ikisinden de HARIC tutariz:
+    - cloud-backup:    buluta yedekleme (Google Drive) → baska cihaza restore edilirse
+                       ayni device_id iki cihazda olur → D2 ihlali.
+    - device-transfer: cihazdan cihaza dogrudan kopyalama (ornek: yeni telefon
+                       kurulumu) → ayni sekilde ayni device_id iki cihaza tasinir.
+
+  Merchant'in kendi data-extraction kurallari varsa: asagidaki iki <exclude>
+  satirini KENDI cloud-backup ve device-transfer bloklarina eklemeleri gerekir.
+  Kurulum notlari icin README "Auto Backup / device_id" bolumune bakin.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="adsparkle_prefs.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="adsparkle_prefs.xml" />
+    </device-transfer>
+</data-extraction-rules>

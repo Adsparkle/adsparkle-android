@@ -10,6 +10,14 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 /**
+ * ADIM 4: SDK çalışma ortamı. [SANDBOX] → tüm giden isteklere (`postback`,
+ * `register-click`) `test: true` eklenir; backend ClickEvent YAZMAZ, postback
+ * yalnızca şekil-doğrulanır (ledger etkilenmez). Android'de `/match` yoktur (S4).
+ * Varsayılan [PRODUCTION]. Kotlin enum → Java'dan da erişilir.
+ */
+enum class AdSparkleEnvironment { PRODUCTION, SANDBOX }
+
+/**
  * AdSparkle — Android client SDK for the AdSparkle tracking platform.
  *
  * Mobile apps use this singleton to forward affiliate attribution events
@@ -35,6 +43,13 @@ object AdSparkle {
 
     private const val TAG = "AdSparkle"
     const val DEFAULT_BASE_URL = "https://api.adsparkle.co"
+
+    // ADIM 5: App Links link-domain soneki. click_id TASIMAYAN bir uri'nin host'u
+    // bununla bitiyorsa (`<slug>.go.adsparkle.co`) register-click ile deterministic
+    // click uretilir. Sadece bu son-eke sahip host'lar register-click tetikler (E1).
+    // Varsayilan prod domaini; `configure(linkDomainSuffix = ...)` ile override edilebilir
+    // (test/prod farkli link domaini — backend LINK_DOMAIN_SUFFIX env'iyle esler).
+    const val DEFAULT_LINK_DOMAIN_SUFFIX = ".go.adsparkle.co"
 
     /** The fixed set of server-recognized event types. */
     object EventType {
@@ -67,6 +82,10 @@ object AdSparkle {
     @Volatile private var companyKey: String? = null
     @Volatile private var baseUrl: String = DEFAULT_BASE_URL
     @Volatile private var debug: Boolean = false
+    /** ADIM 4: sandbox modu mu? true ise giden body'lere `test: true` eklenir. */
+    @Volatile private var isSandbox: Boolean = false
+    /** ADIM 5: App Links link-domain soneki (configure ile override edilebilir; @Volatile → thread-safe). */
+    @Volatile private var linkDomainSuffix: String = DEFAULT_LINK_DOMAIN_SUFFIX
 
     // -------------------------------------------------------------------------
     // Configuration
@@ -88,6 +107,13 @@ object AdSparkle {
         companyKey: String,
         baseUrl: String = DEFAULT_BASE_URL,
         debug: Boolean = false,
+        // ADIM 4: @JvmOverloads TUZAĞI — environment EN SONA konur (debug'dan sonra).
+        // Aksi halde eski `configure(context, companyKey, baseUrl, debug)` Java overload'ı
+        // 4. arg'ı environment'a maplar → tip uyuşmazlığı. Sona koyunca eski imza korunur.
+        environment: AdSparkleEnvironment = AdSparkleEnvironment.PRODUCTION,
+        // ADIM 5: link domain soneki EN SONA konur (yukaridaki @JvmOverloads tuzagi geregi —
+        // yeni param sona → eski Java overload imzalari korunur).
+        linkDomainSuffix: String = DEFAULT_LINK_DOMAIN_SUFFIX,
     ) {
         synchronized(lock) {
             val store = storage ?: Storage(context.applicationContext).also { storage = it }
@@ -95,9 +121,14 @@ object AdSparkle {
             this.debug = debug
             this.companyKey = companyKey
             this.baseUrl = baseUrl.ifBlank { DEFAULT_BASE_URL }
+            this.isSandbox = (environment == AdSparkleEnvironment.SANDBOX)
+            // Bas nokta + lowercase normalize (host karsilastirmasi lowercase host + `.suffix`).
+            val normSuffix = linkDomainSuffix.lowercase()
+            this.linkDomainSuffix = if (normSuffix.startsWith(".")) normSuffix else ".$normSuffix"
 
             store.companyKey = this.companyKey
             store.baseUrl = this.baseUrl
+            store.isSandbox = this.isSandbox
 
             if (client == null) client = PostbackClient(debug)
             if (executor == null) {
@@ -107,6 +138,28 @@ object AdSparkle {
             }
 
             if (debug) Log.d(TAG, "Configured. baseUrl=${this.baseUrl}")
+        }
+
+        // Android deferred attribution onceligi (ADIM 5 + KARAR 3). Yalnizca HALA
+        // click_id yoksa calisir (handleDeepLink araya girmis olabilir):
+        //   1. click_id zaten var        → hicbir sey yapma.
+        //   2. bekleyen register-click   → App Links DETERMINISTIC click; Install
+        //      (App Links, app yuklu)      Referrer'DAN ONCE dene (E3 retry).
+        //   3. Play Install Referrer      → BIR KEZ oku, `referrer=click_id=<uuid>`.
+        //   4. /match CAGIRMA             → Android'de probabilistic eslesme yok (S4).
+        // Referrer callback async doner; o sirada click_id set edilmis olabilecegi
+        // icin yalnizca HALA bos ise uygulanir.
+        storage?.let { store ->
+            if (store.clickId.isNullOrEmpty()) {
+                if (store.pendingRegisterClick != null) {
+                    attemptRegisterClick(store)
+                } else if (!store.referrerChecked) {
+                    store.referrerChecked = true
+                    InstallReferrerReader.fetch(context.applicationContext, debug) { clickId ->
+                        if (getClickId().isNullOrEmpty()) setClickId(clickId)
+                    }
+                }
+            }
         }
 
         // Attempt to send anything that failed on a previous run.
@@ -130,18 +183,110 @@ object AdSparkle {
     }
 
     /**
-     * Extracts `click_id` from a deep-link [uri] (`?click_id=<uuid>`), persists
-     * it as the active click id, and appends it to the click chain (de-duped,
-     * max 50, 7-day sliding TTL). No-op when [uri] is null or carries no valid
-     * click id.
+     * Handles a deep-link / App Links [uri].
+     *
+     * 1. `?click_id=<uuid>` tasiyorsa: onu aktif click id yapar ve zincire ekler
+     *    (de-duped, max 50, 7-gun kayan TTL).
+     * 2. click_id YOKSA ama host `*.go.adsparkle.co` ise (App Links ile app YUKLU
+     *    acilmis → sunucuya ugranmamis): ADIM 5 register-click ile deterministic
+     *    click'i APP olusturur. Istek [Storage.pendingRegisterClick]'e yazilir ve
+     *    hemen denenir; hata olursa saklanip configure()/track()'te tekrar denenir
+     *    (E3). Cihaz fingerprint'i GONDERILMEZ.
+     *
+     * [uri] null / gecersiz / bilinmeyen host ise no-op.
      */
     @JvmStatic
     fun handleDeepLink(uri: Uri?) {
-        val clickId = DeepLink.extractClickId(uri) ?: run {
-            if (debug) Log.d(TAG, "handleDeepLink: no click_id in uri")
+        // (1) URL'de dogrudan click_id → onu kullan (mevcut davranis).
+        val directClickId = DeepLink.extractClickId(uri)
+        if (directClickId != null) {
+            setClickId(directClickId)
             return
         }
-        setClickId(clickId)
+
+        // Zaten bir click_id yakalanmissa register-click'e gerek yok.
+        if (!getClickId().isNullOrEmpty()) return
+
+        // (2) E1: click_id yok — host link-domain mi? Degilse no-op.
+        val target = DeepLink.extractLinkTarget(uri)
+        if (target == null || !target.host.endsWith(linkDomainSuffix)) {
+            if (debug) Log.d(TAG, "handleDeepLink: no click_id / not a link-domain uri")
+            return
+        }
+
+        val store = storage ?: run {
+            warnNotConfigured("handleDeepLink")
+            return
+        }
+
+        // E2: bekleyen register-click istegini kalici sakla (unique_key + query),
+        // sonra dene (E3 retry mekanizmasi). platform/device_id RegisterClient'ta.
+        val pending = JSONObject()
+        pending.put("unique_key", target.uniqueKey)
+        val qp = JSONObject()
+        for ((k, v) in target.queryParams) qp.put(k, v)
+        pending.put("query_params", qp)
+        store.pendingRegisterClick = pending.toString()
+
+        attemptRegisterClick(store)
+    }
+
+    /**
+     * ADIM 5: bekleyen register-click istegini backend'e gonderir (E3).
+     *
+     * Async (executor uzerinde). Basari → click_id set edilir ve pending temizlenir.
+     * Hata (4xx/5xx/ag) → pending KORUNUR; sonraki configure()/track()/deep-link'te
+     * tekrar denenir. click_id bu arada baska bir yoldan geldiyse (yaris) no-op.
+     */
+    private fun attemptRegisterClick(store: Storage) {
+        val key = companyKey ?: return
+        val exec = executor ?: return
+        if (!getClickId().isNullOrEmpty()) return
+        val pendingJson = store.pendingRegisterClick ?: return
+        val currentBaseUrl = baseUrl
+        val deviceId = store.getOrCreateDeviceId()
+
+        exec.execute {
+            // Yaris: baska bir yol (dogrudan click_id / referrer) araya girmis olabilir.
+            if (!getClickId().isNullOrEmpty()) return@execute
+            val parsed = try {
+                JSONObject(pendingJson)
+            } catch (_: Exception) {
+                store.pendingRegisterClick = null // bozuk kayit → temizle
+                return@execute
+            }
+            val uniqueKey = parsed.optString("unique_key", "")
+            if (uniqueKey.isEmpty()) {
+                store.pendingRegisterClick = null
+                return@execute
+            }
+            val params = LinkedHashMap<String, String>()
+            val qpObj = parsed.optJSONObject("query_params")
+            if (qpObj != null) {
+                val it = qpObj.keys()
+                while (it.hasNext()) {
+                    val name = it.next()
+                    params[name] = qpObj.optString(name, "")
+                }
+            }
+            val referrer = parsed.optString("referrer").takeIf { it.isNotEmpty() }
+
+            val clickId = RegisterClient.resolve(
+                baseUrl = currentBaseUrl,
+                companyKey = key,
+                uniqueKey = uniqueKey,
+                deviceId = deviceId,
+                queryParams = params,
+                referrer = referrer,
+                test = isSandbox,
+                debug = debug,
+            )
+            if (clickId != null) {
+                store.pendingRegisterClick = null // basari → temizle (E3)
+                if (getClickId().isNullOrEmpty()) setClickId(clickId)
+            }
+            // clickId == null: pending KORUNUR — bir sonraki tetikte tekrar denenir.
+        }
     }
 
     /**
@@ -164,11 +309,83 @@ object AdSparkle {
         store.clickId = trimmed
         store.addClickId(trimmed)
         if (debug) Log.d(TAG, "clickId captured")
+        // ADIM 6a: click_id geldi → bekleyen deferred olaylari (install-oncesi track'ler)
+        // gonder. flush once kuyrugu bosaltir, sonra her birini track() ile yollar.
+        flushDeferred(store)
     }
 
     /** Returns the currently active click id, or null if none captured yet. */
     @JvmStatic
     fun getClickId(): String? = storage?.clickId
+
+    // -------------------------------------------------------------------------
+    // ADIM 6a: Deferred events (click_id henuz yokken cagrilan track'ler)
+    // -------------------------------------------------------------------------
+
+    /**
+     * click_id YOKKEN gelen track'i kalici deferred kuyruga alir (DROP yerine —
+     * iOS/RN/Flutter paritesi). Event verisi (click_id/user_id HARIC) JSON'a
+     * serialize edilir; click_id gelince [flushDeferred] yeniden track eder.
+     */
+    private fun enqueueDeferredEvent(store: Storage, eventType: String, event: AdSparkleEvent, test: Boolean) {
+        val json = JSONObject()
+        json.put("event_type", eventType)
+        // Q2: enqueue-ANI sandbox flag'i event'le SAKLANIR (flush'ta guncel state degil
+        // BU deger kullanilir → sandbox event sandbox kalir).
+        if (test) json.put("test", true)
+        event.transactionId?.let { json.put("transaction_id", it) }
+        event.amount?.let { json.put("amount", it) }
+        event.currency?.let { json.put("currency", it) }
+        event.productIds?.takeIf { it.isNotEmpty() }?.let { json.put("product_ids", JSONArray(it)) }
+        event.customParams?.takeIf { it.isNotEmpty() }?.let { params ->
+            val obj = JSONObject()
+            for ((k, v) in params) obj.put(k, v)
+            json.put("custom_params", obj)
+        }
+        store.enqueueDeferred(json.toString())
+    }
+
+    /**
+     * click_id set edildikten SONRA cagrilir. Kuyrugu ATOMIK bosaltir (yaris/cift-
+     * gonderim olmasin), sonra her deferred olayi track() ile yeniden gonderir —
+     * artik click_id VAR → send path'e girer, tekrar defer edilmez (sonsuz dongu yok).
+     */
+    private fun flushDeferred(store: Storage) {
+        val events = store.drainDeferredEvents()
+        if (events.isEmpty()) return
+        if (debug) Log.d(TAG, "flushing ${events.size} deferred event(s)")
+        for (raw in events) {
+            val parsed = try {
+                JSONObject(raw)
+            } catch (_: Exception) {
+                continue // bozuk kayit → atla
+            }
+            val eventType = parsed.optString("event_type", "")
+            if (eventType.isEmpty()) continue
+            val productIds = parsed.optJSONArray("product_ids")?.let { arr ->
+                (0 until arr.length()).map { arr.optString(it) }
+            }
+            val customParams = parsed.optJSONObject("custom_params")?.let { obj ->
+                val m = HashMap<String, String>()
+                val keys = obj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    m[k] = obj.optString(k)
+                }
+                m
+            }
+            // Q2: enqueue-aninda saklanan sandbox flag'i (guncel state DEGIL) kullanilir.
+            val storedTest = parsed.optBoolean("test", false)
+            val event = AdSparkleEvent(
+                transactionId = parsed.optString("transaction_id").takeIf { it.isNotEmpty() },
+                amount = parsed.optDouble("amount", Double.NaN).takeIf { !it.isNaN() },
+                currency = parsed.optString("currency").takeIf { it.isNotEmpty() },
+                productIds = productIds,
+                customParams = customParams,
+            )
+            trackInternal(eventType, event, storedTest)
+        }
+    }
 
     // -------------------------------------------------------------------------
     // Tracking
@@ -185,6 +402,14 @@ object AdSparkle {
     @JvmStatic
     @JvmOverloads
     fun track(eventType: String, event: AdSparkleEvent = AdSparkleEvent()) {
+        trackInternal(eventType, event, null)
+    }
+
+    // Q2 (ADIM 6a): testOverride — flush'ta deferred event'in ENQUEUE-ANI sandbox
+    // flag'i gecirilir → sandbox event, hangi env'de flush olursa olsun sandbox KALIR
+    // (dev/prod karismaz; app-restart + env degisimi kenar durumu). Normal track'te
+    // null → guncel [isSandbox] kullanilir. Public API degismedi.
+    private fun trackInternal(eventType: String, event: AdSparkleEvent, testOverride: Boolean?) {
         val store = storage
         val key = companyKey
         val httpClient = client
@@ -200,10 +425,17 @@ object AdSparkle {
             return
         }
 
+        val effectiveTest = testOverride ?: isSandbox
         val clickId = store.clickId
 
         if (clickId.isNullOrEmpty()) {
-            if (debug) Log.w(TAG, "track skipped: no click_id (call handleDeepLink/setClickId first)")
+            // ADIM 6a: click_id yok → DROP ETME, deferred kuyruga al (iOS/RN/Flutter
+            // paritesi; install-oncesi track'ler kaybolmasin). Once bekleyen register-
+            // click'i tekrar dene (basarida click_id gelir → setClickId → flushDeferred
+            // bunlari gonderir). Kalici (SharedPreferences), uygulama kapansa bile durur.
+            attemptRegisterClick(store)
+            enqueueDeferredEvent(store, eventType, event, effectiveTest)
+            if (debug) Log.w(TAG, "No click_id yet — deferred '$eventType' (queued)")
             return
         }
 
@@ -213,7 +445,7 @@ object AdSparkle {
         val userId = store.userId?.takeIf { it.isNotEmpty() } ?: getOrCreateAnonId(store)
 
         val clickIds = store.getClickIds()
-        val payload = buildPayload(eventType, clickId, clickIds, userId, event)
+        val payload = buildPayload(eventType, clickId, clickIds, userId, event, effectiveTest)
         val currentBaseUrl = baseUrl
 
         exec.execute {
@@ -375,6 +607,7 @@ object AdSparkle {
         clickIds: List<String>,
         userId: String,
         event: AdSparkleEvent,
+        test: Boolean,
     ): String {
         val json = JSONObject()
         json.put("click_id", clickId)
@@ -400,6 +633,11 @@ object AdSparkle {
             for ((k, v) in params) obj.put(k, v)
             json.put("custom_params", obj)
         }
+
+        // ADIM 4: sandbox → backend postback'i yalnızca şekil-doğrular, ledger'a/DB'ye
+        // yazmaz (HMAC de bypass). Q2: `test` cagiran taraftan gelir (normal track'te
+        // isSandbox, flush'ta event'in enqueue-anI flag'i).
+        if (test) json.put("test", true)
 
         return json.toString()
     }

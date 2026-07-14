@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  AdSparkle SDK — Auto Backup haric-tutma kurallari (API 23-30 icin
+  android:fullBackupContent).
+
+  adsparkle_prefs, SDK'nin KALICI device_id'sini tutar (register-click ve iOS
+  paritesindeki /match icin D2 "tek-tuketim" idempotency anahtari). Android Auto
+  Backup VARSAYILAN OLARAK ACIKTIR: bu dosya buluta yedeklenir ve YENI/BASKA bir
+  cihaza geri yuklenirse iki farkli cihaz AYNI device_id'yi gonderir → D2
+  idempotency ihlali (tek bir install/click iki cihaza dagilir). Bu nedenle
+  SDK'nin kendi prefs dosyasi yedekten HARIC tutulur.
+
+  Merchant'in kendi backup kurallari varsa: asagidaki <exclude> satirini KENDI
+  full-backup-content dosyalarina eklemeleri gerekir (bu dosyayi dogrudan referans
+  vermek merchant'in mevcut kurallarini gecersiz kilar). Kurulum notlari icin
+  README "Auto Backup / device_id" bolumune bakin.
+-->
+<full-backup-content>
+    <exclude domain="sharedpref" path="adsparkle_prefs.xml" />
+</full-backup-content>

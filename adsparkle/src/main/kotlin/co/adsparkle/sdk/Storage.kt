@@ -35,6 +35,53 @@ internal class Storage(context: Context) {
         set(value) = prefs.edit().putString(KEY_CLICK_ID, value).apply()
 
     /**
+     * Play Install Referrer BIR KEZ okundu mu? Referrer yalnizca kurulumdan hemen
+     * sonra anlamli ve sabittir; her configure()'da tekrar sorgulamamak icin flag.
+     */
+    var referrerChecked: Boolean
+        get() = prefs.getBoolean(KEY_REFERRER_CHECKED, false)
+        set(value) = prefs.edit().putBoolean(KEY_REFERRER_CHECKED, value).apply()
+
+    /**
+     * ADIM 4: SDK sandbox modunda mı? configure()'da set edilir (Android config'i
+     * companyKey/baseUrl gibi her launch configure() ile gelir). Varsayılan false.
+     */
+    var isSandbox: Boolean
+        get() = prefs.getBoolean(KEY_IS_SANDBOX, false)
+        set(value) = prefs.edit().putBoolean(KEY_IS_SANDBOX, value).apply()
+
+    /**
+     * SDK'nin kendi urettigi KALICI cihaz UUID'si (register-click `device_id` — D2
+     * tek-tuketim / E5 dedup anahtari). Ilk cagrida uretilir ve saklanir; ayni
+     * cihaz her zaman AYNI UUID'yi dondurur. ANDROID_ID veya reklam kimligi DEGIL.
+     *
+     * ONEMLI: [PREFS_NAME] Auto Backup'tan HARIC tutulmali (bkz.
+     * res/xml/adsparkle_backup_rules.xml + res/xml/adsparkle_data_extraction_rules.xml).
+     * Aksi halde bulut-yedek / cihaz-transferi ile ayni id iki cihaza tasinir →
+     * iki farkli cihaz ayni device_id gonderir → D2 idempotency ihlali.
+     */
+    fun getOrCreateDeviceId(): String = synchronized(lock) {
+        val existing = prefs.getString(KEY_DEVICE_ID, null)
+        if (!existing.isNullOrEmpty()) return existing
+        val generated = java.util.UUID.randomUUID().toString()
+        prefs.edit().putString(KEY_DEVICE_ID, generated).apply()
+        generated
+    }
+
+    /**
+     * ADIM 5: App Links ile yakalanan bekleyen register-click istegi. JSON string:
+     * `{ "unique_key": ..., "query_params": {...}, "referrer"?: ... }`.
+     * Basariya kadar SAKLANIR; configure()/track()'te tekrar denenir (E3).
+     * Basarida null'lanir (kaydi siler).
+     */
+    var pendingRegisterClick: String?
+        get() = prefs.getString(KEY_PENDING_REGISTER_CLICK, null)
+        set(value) = prefs.edit().apply {
+            if (value == null) remove(KEY_PENDING_REGISTER_CLICK)
+            else putString(KEY_PENDING_REGISTER_CLICK, value)
+        }.apply()
+
+    /**
      * Ordered, de-duplicated chain of recent click ids (most recent last).
      *
      * Implements a sliding 7-day TTL ([CHAIN_TTL_MS]): if the chain has not been
@@ -108,6 +155,32 @@ internal class Storage(context: Context) {
         current
     }
 
+    // ---- ADIM 6a: Deferred events (click_id YOKKEN cagrilan track'ler) ----
+    // pending_queue'dan AYRI: pending = click_id'li ama gonderilemeyen (retry);
+    // deferred = click_id HENUZ YOK (install-oncesi track). Kalici (SharedPreferences).
+
+    fun getDeferredEvents(): List<String> = synchronized(lock) {
+        readStringList(KEY_DEFERRED_EVENTS)
+    }
+
+    fun enqueueDeferred(eventJson: String) = synchronized(lock) {
+        val current = readStringList(KEY_DEFERRED_EVENTS).toMutableList()
+        current.add(eventJson)
+        while (current.size > MAX_DEFERRED) {
+            current.removeAt(0) // FIFO cap — en eskiyi dus (sonsuz buyume yok)
+        }
+        writeStringList(KEY_DEFERRED_EVENTS, current)
+    }
+
+    /** Atomically returns and clears the entire deferred queue (flush icin). */
+    fun drainDeferredEvents(): List<String> = synchronized(lock) {
+        val current = readStringList(KEY_DEFERRED_EVENTS)
+        if (current.isNotEmpty()) {
+            prefs.edit().remove(KEY_DEFERRED_EVENTS).apply()
+        }
+        current
+    }
+
     // ---- JSON-array <-> List<String> helpers ----
 
     private fun readStringList(key: String): List<String> {
@@ -137,6 +210,9 @@ internal class Storage(context: Context) {
         const val MAX_CLICK_IDS = 50
         const val MAX_PENDING = 100
 
+        /** ADIM 6a: click_id gelene kadar bekleyen deferred olaylarin FIFO cap'i. */
+        const val MAX_DEFERRED = 100
+
         /** Sliding attribution window: 7 days in milliseconds. */
         const val CHAIN_TTL_MS = 604800000L
 
@@ -153,5 +229,10 @@ internal class Storage(context: Context) {
         private const val KEY_CLICK_IDS = "click_ids"
         private const val KEY_CLICK_IDS_TS = "click_ids_ts"
         private const val KEY_PENDING_QUEUE = "pending_queue"
+        private const val KEY_DEFERRED_EVENTS = "deferred_events"
+        private const val KEY_REFERRER_CHECKED = "referrer_checked"
+        private const val KEY_IS_SANDBOX = "is_sandbox"
+        private const val KEY_DEVICE_ID = "device_id"
+        private const val KEY_PENDING_REGISTER_CLICK = "pending_register_click"
     }
 }
